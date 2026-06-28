@@ -8,33 +8,27 @@ import asyncio
 import json
 import logging
 import os
-from pathlib import Path
+import re
+from urllib.parse import urljoin
+
+import httpx
+from bs4 import BeautifulSoup
+from fake_useragent import UserAgent
 
 from aiogram import Bot, Dispatcher, Router
 from aiogram.filters import Command, CommandObject
 from aiogram.types import (CallbackQuery, FSInputFile, InlineKeyboardButton,
                            InlineKeyboardMarkup, Message)
-from fake_useragent import UserAgent
-from playwright.async_api import async_playwright, Page
-from playwright_stealth import Stealth
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8977938351:AAEvSZwKKPksvhYhmDNsNBRtnSQYZahZYB0")
 OWNER_ID = int(os.getenv("OWNER_ID", "8341333063"))
 LOLZ_LOGIN = os.getenv("LOLZ_LOGIN", "gsertoifur@gmail.com")
 LOLZ_PASSWORD = os.getenv("LOLZ_PASSWORD", "vinstik123")
-USE_PROXY = os.getenv("USE_PROXY", "0") == "1"
-PROXY_SERVER = os.getenv("PROXY_SERVER", "http://127.0.0.1:10808")
 
 FORUM_BASE = "https://lolz.live"
 FORUM_URL = "https://lolz.live/forums/832/"
-USER_DATA_DIR = Path(os.getenv("BROWSER_PROFILE", "./browser_profile_lolz"))
-OUTPUT_DIR = Path("./output")
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
-STEALTH = Stealth(
-    navigator_languages_override=("ru-RU", "ru"),
-    navigator_platform_override="Win32",
-)
+OUTPUT_DIR = os.getenv("OUTPUT_DIR", "./output")
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("anketa")
@@ -48,125 +42,91 @@ CHAT_PREFIXES = ("https://t.me/+Lr_o08HwF8NkYTEy", "https://t.me/+e_mGvWWzQp40Zj
 parse_state = {"cancel": False, "threads": [], "running": False, "mode": "all", "count": 20}
 
 
-# ── Playwright ─────────────────────────────────────────────────────────────
+# ── HTTP-парсер ────────────────────────────────────────────────────────────
 
-async def nav(page: Page, url: str) -> bool:
-    for attempt in range(1, 4):
-        try:
-            r = await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
-            if r and r.status in (403, 429):
-                await asyncio.sleep(3 * attempt)
-                continue
-            await asyncio.sleep(1)
-            return True
-        except Exception as e:
-            log.warning("nav err %d: %s", attempt, e)
-            await asyncio.sleep(2 * attempt)
-    return False
+def make_client() -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        headers={"User-Agent": UserAgent().random},
+        follow_redirects=True,
+        timeout=30,
+        verify=False,
+    )
 
 
-async def lolz_login(page: Page) -> bool:
-    if not await nav(page, "https://lolz.live/login/"):
-        return False
-    await asyncio.sleep(2)
-    email_input = (await page.query_selector('input[name="login"]')
-                   or await page.query_selector('input[type="email"]'))
-    if not email_input:
-        avatar = await page.query_selector('.avatar, .username, a[href*="account"]')
-        if avatar:
-            log.info("Уже залогинены")
-            return True
-        return False
-    await email_input.click()
-    await email_input.fill(LOLZ_LOGIN)
-    await asyncio.sleep(0.3)
-    pass_input = (await page.query_selector('input[name="password"]')
-                  or await page.query_selector('input[type="password"]'))
-    if not pass_input:
-        return False
-    await pass_input.click()
-    await pass_input.fill(LOLZ_PASSWORD)
-    await asyncio.sleep(0.3)
-    submit = (await page.query_selector('button[type="submit"]')
-              or await page.query_selector('input[type="submit"]'))
-    if submit:
-        await submit.click()
-        await asyncio.sleep(3)
-    log.info("Логин выполнен")
+async def lolz_login(client: httpx.AsyncClient) -> bool:
+    # Получаем страницу логина для csrf
+    resp = await client.get("https://lolz.live/login/")
+    soup = BeautifulSoup(resp.text, "lxml")
+    token_el = soup.select_one('input[name="_xfToken"]')
+    token = token_el["value"] if token_el else ""
+
+    # Логинимся
+    data = {
+        "login": LOLZ_LOGIN,
+        "password": LOLZ_PASSWORD,
+        "remember": "1",
+        "_xfToken": token,
+    }
+    resp = await client.post("https://lolz.live/login/", data=data)
+    if "logout" in resp.text.lower() or resp.url.path == "/":
+        log.info("Логин выполнен")
+        return True
+    log.warning("Логин не подтверждён, пробуем продолжить")
     return True
 
 
-async def get_pages(page: Page) -> int:
-    try:
-        nav_el = await page.query_selector(".PageNav")
-        if not nav_el:
-            return 1
-        last = await nav_el.query_selector("a:last-child")
-        if last:
-            t = (await last.inner_text()).strip()
-            if t.isdigit():
-                return int(t)
-    except Exception:
-        pass
+def parse_listing(html: str) -> list[dict]:
+    soup = BeautifulSoup(html, "lxml")
+    threads = []
+    for el in soup.select("div.discussionListItem"):
+        try:
+            link = el.select_one("a.listBlock.main")
+            if not link:
+                continue
+            href = link.get("href", "")
+            title_el = link.select_one("h3.title .spanTitle") or link.select_one("h3.title")
+            title = title_el.get_text(strip=True) if title_el else "N/A"
+            author_el = (link.select_one(".username.threadCreator .styleUserNickname")
+                         or link.select_one(".threadCreator"))
+            author = author_el.get_text(strip=True) if author_el else "N/A"
+            date_el = link.select_one(".startDate")
+            date = date_el.get_text(strip=True) if date_el else ""
+            url = href if href.startswith("http") else f"{FORUM_BASE}/{href.lstrip('/')}"
+            threads.append({
+                "title": title,
+                "author": author,
+                "url": url,
+                "date": date,
+                "tg": [],
+            })
+        except Exception as e:
+            log.warning("parse err: %s", e)
+    return threads
+
+
+def get_page_count(html: str) -> int:
+    soup = BeautifulSoup(html, "lxml")
+    nav = soup.select_one(".PageNav")
+    if not nav:
+        return 1
+    last = nav.select("a")[-1] if nav.select("a") else None
+    if last:
+        t = last.get_text(strip=True)
+        if t.isdigit():
+            return int(t)
     return 1
 
 
-EXTRACT_JS = """
-() => {
-    const allLinks = [];
-    document.querySelectorAll('a[href*="t.me/"]').forEach(a => {
-        allLinks.push({href: a.href, text: a.textContent.trim()});
-    });
-    const tgResolve = [];
-    document.querySelectorAll('a[href*="tg://resolve"]').forEach(a => {
-        tgResolve.push(a.href);
-    });
-    document.querySelectorAll('[data-value*="tg://resolve"]').forEach(el => {
-        tgResolve.push(el.getAttribute('data-value'));
-    });
-    const firstMsg = document.querySelector('.messageList .message');
-    const firstMsgText = firstMsg ? (firstMsg.textContent || '') : '';
-    const atMentions = (firstMsgText.match(/@[a-zA-Z0-9_]{3,40}/g) || []);
-    const tgFromAttrs = [];
-    document.querySelectorAll('[data-tg-url], [data-telegram-url]').forEach(el => {
-        const v = el.getAttribute('data-tg-url') || el.getAttribute('data-telegram-url');
-        if (v) tgFromAttrs.push(v);
-    });
-    const bbCode = (document.body.innerHTML.match(/https?:\\/\\/t\\.me\\/[a-zA-Z0-9_]+/g) || []);
-    return {
-        allLinks,
-        tgResolve: [...new Set(tgResolve)],
-        atMentions: [...new Set(atMentions)],
-        tgFromAttrs,
-        bbCode: [...new Set(bbCode)]
-    };
-}
-"""
-
-
-def filter_contacts(result: dict) -> list[str]:
+def extract_tg(html: str) -> list[str]:
     raw = set()
 
-    for link in result.get("allLinks", []):
-        href = link["href"]
-        raw.add(href)
+    for m in re.findall(r'tg://resolve\?domain=([a-zA-Z0-9_]+)', html):
+        raw.add(f"https://t.me/{m}")
 
-    for url in result.get("tgResolve", []):
-        if url:
-            if "domain=" in url:
-                username = url.split("domain=")[-1].split("&")[0]
-                raw.add(f"https://t.me/{username}")
-            else:
-                raw.add(url)
+    for m in re.findall(r'https?://t\.me/([a-zA-Z0-9_]+)', html):
+        raw.add(f"https://t.me/{m}")
 
-    for href in result.get("tgFromAttrs", []):
-        if href:
-            raw.add(href)
-
-    for url in result.get("bbCode", []):
-        raw.add(url)
-
-    for m in result.get("atMentions", []):
+    for m in re.findall(r'@[a-zA-Z0-9_]{3,40}', html):
         raw.add(m)
 
     contacts = []
@@ -185,86 +145,31 @@ def filter_contacts(result: dict) -> list[str]:
     return list(dict.fromkeys(contacts))
 
 
-async def extract_tg_from_thread(page: Page, url: str) -> list[str]:
-    if not await nav(page, url):
-        return []
-    try:
-        result = await page.evaluate(EXTRACT_JS)
-        return filter_contacts(result)
-    except Exception as e:
-        log.warning("extract err: %s", e)
-        return []
-
-
-async def parse_listing(page: Page) -> list[dict]:
-    threads = []
-    for el in await page.query_selector_all("div.discussionListItem"):
-        try:
-            link = await el.query_selector("a.listBlock.main")
-            if not link:
-                continue
-            href = await link.get_attribute("href") or ""
-            title_el = (await link.query_selector("h3.title .spanTitle")
-                        or await link.query_selector("h3.title"))
-            title = await title_el.inner_text() if title_el else "N/A"
-            author_el = (await link.query_selector(".username.threadCreator .styleUserNickname")
-                         or await link.query_selector(".threadCreator"))
-            author = await author_el.inner_text() if author_el else "N/A"
-            date_el = await link.query_selector(".startDate")
-            date = await date_el.inner_text() if date_el else ""
-            url_full = href if href.startswith("http") else f"{FORUM_BASE}/{href.lstrip('/')}"
-            threads.append({
-                "title": title.strip(),
-                "author": author.strip(),
-                "url": url_full,
-                "date": date.strip(),
-                "tg": [],
-            })
-        except Exception as e:
-            log.warning("list parse err: %s", e)
-    return threads
-
-
 async def scrape(max_pages: int = 5, stop_event: asyncio.Event | None = None,
                  progress_callback=None) -> list[dict]:
     all_threads = []
-    async with STEALTH.use_async(async_playwright()) as p:
-        launch_args = {
-            "headless": True,
-            "args": ["--disable-blink-features=AutomationControlled", "--no-sandbox",
-                     "--disable-dev-shm-usage"],
-        }
-        if USE_PROXY:
-            launch_args["proxy"] = {"server": PROXY_SERVER}
-
-        browser = await p.chromium.launch(**launch_args)
-        ctx = await browser.new_context(
-            viewport={"width": 1920, "height": 1080},
-            locale="ru-RU",
-            user_agent=UserAgent().random,
-        )
-        page = await ctx.new_page()
-
+    client = make_client()
+    try:
         log.info("Логинюсь на lolz.live...")
-        await lolz_login(page)
+        await lolz_login(client)
 
-        if not await nav(page, FORUM_URL):
-            log.error("Не удалось открыть форум")
-            await browser.close()
+        resp = await client.get(FORUM_URL)
+        if resp.status_code != 200:
+            log.error("Не удалось открыть форум: %d", resp.status_code)
             return []
 
-        total = min(await get_pages(page), max_pages)
+        total = min(get_page_count(resp.text), max_pages)
         log.info("Страниц: %d", total)
 
         for pg in range(1, total + 1):
             if stop_event and stop_event.is_set():
                 break
             url = FORUM_URL if pg == 1 else f"{FORUM_URL}page-{pg}"
-            if pg > 1 and not await nav(page, url):
-                continue
-            await page.mouse.wheel(0, 400)
-            await asyncio.sleep(0.5)
-            threads = await parse_listing(page)
+            if pg > 1:
+                resp = await client.get(url)
+                if resp.status_code != 200:
+                    continue
+            threads = parse_listing(resp.text)
             all_threads.extend(threads)
             log.info("Стр %d/%d: %d тем", pg, total, len(threads))
             if progress_callback:
@@ -277,19 +182,25 @@ async def scrape(max_pages: int = 5, stop_event: asyncio.Event | None = None,
             if stop_event and stop_event.is_set():
                 break
             log.info("[%d/%d] %s", i + 1, len(all_threads), t["title"][:50])
-            t["tg"] = await extract_tg_from_thread(page, t["url"])
-            if t["tg"]:
-                log.info("  TG: %s", t["tg"])
+            try:
+                resp = await client.get(t["url"])
+                if resp.status_code == 200:
+                    t["tg"] = extract_tg(resp.text)
+                    if t["tg"]:
+                        log.info("  TG: %s", t["tg"])
+            except Exception as e:
+                log.warning("extract err: %s", e)
             if progress_callback and (i + 1) % 5 == 0:
                 tg_count = sum(1 for x in all_threads[:i+1] if x.get("tg"))
                 await progress_callback(f"[{i+1}/{len(all_threads)}] TG найдено: {tg_count}")
-            await asyncio.sleep(0.8)
+            await asyncio.sleep(0.5)
+    finally:
+        await client.aclose()
 
-        await browser.close()
-
-    fname = OUTPUT_DIR / "ankety_ishu_rabotu.json"
-    fname.write_text(json.dumps(all_threads, ensure_ascii=False, indent=2), encoding="utf-8")
-    log.info("Сохранено %d анкет -> %s", len(all_threads), fname)
+    fpath = os.path.join(OUTPUT_DIR, "ankety_ishu_rabotu.json")
+    with open(fpath, "w", encoding="utf-8") as f:
+        json.dump(all_threads, f, ensure_ascii=False, indent=2)
+    log.info("Сохранено %d анкет -> %s", len(all_threads), fpath)
     return all_threads
 
 
@@ -479,11 +390,12 @@ async def on_stop(cb: CallbackQuery) -> None:
 async def cmd_list(message: Message) -> None:
     if message.from_user.id != OWNER_ID:
         return
-    fpath = OUTPUT_DIR / "ankety_ishu_rabotu.json"
-    if not fpath.exists():
+    fpath = os.path.join(OUTPUT_DIR, "ankety_ishu_rabotu.json")
+    if not os.path.exists(fpath):
         await message.answer("Сначала /scrape")
         return
-    threads = json.loads(fpath.read_text(encoding="utf-8"))
+    with open(fpath, encoding="utf-8") as f:
+        threads = json.load(f)
     if not threads:
         await message.answer("Пусто.")
         return
@@ -501,11 +413,12 @@ async def cmd_list(message: Message) -> None:
 async def cmd_anketa(message: Message, command: CommandObject) -> None:
     if message.from_user.id != OWNER_ID:
         return
-    fpath = OUTPUT_DIR / "ankety_ishu_rabotu.json"
-    if not fpath.exists():
+    fpath = os.path.join(OUTPUT_DIR, "ankety_ishu_rabotu.json")
+    if not os.path.exists(fpath):
         await message.answer("Сначала /scrape")
         return
-    threads = json.loads(fpath.read_text(encoding="utf-8"))
+    with open(fpath, encoding="utf-8") as f:
+        threads = json.load(f)
     try:
         idx = int((command.args or "").strip())
         t = threads[idx - 1]
@@ -518,10 +431,7 @@ async def cmd_anketa(message: Message, command: CommandObject) -> None:
 # ── Запуск ─────────────────────────────────────────────────────────────────
 
 async def main():
-    bot_kwargs = {"token": BOT_TOKEN}
-    if USE_PROXY:
-        bot_kwargs["proxy"] = PROXY_SERVER
-    bot = Bot(**bot_kwargs)
+    bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher()
     dp.include_router(router)
     log.info("Бот запущен, владелец: %s", OWNER_ID)
