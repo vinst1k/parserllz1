@@ -158,6 +158,11 @@ async def scrape(max_pages: int = 5, stop_event: asyncio.Event | None = None,
             log.error("Не удалось открыть форум: %d", resp.status_code)
             return []
 
+        debug_path = os.path.join(OUTPUT_DIR, "debug_railway.html")
+        with open(debug_path, "w", encoding="utf-8") as f:
+            f.write(resp.text)
+        log.info("HTML сохранён: %s", debug_path)
+
         total = min(get_page_count(resp.text), max_pages)
         log.info("Страниц: %d", total)
 
