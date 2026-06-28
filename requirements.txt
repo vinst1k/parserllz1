@@ -1,0 +1,4 @@
+aiogram==3.15.0
+playwright==1.49.1
+playwright-stealth==1.0.6
+fake-useragent==2.0.3
