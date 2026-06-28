@@ -1,20 +1,9 @@
-FROM python:3.12-slim
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    wget gnupg ca-certificates fonts-liberation \
-    libnss3 libxss1 libasound2 libatk-bridge2.0-0 libatk1.0-0 \
-    libcups2 libdrm2 libxcomposite1 libxdamage1 libxrandr2 \
-    libgbm1 libpango-1.0-0 libcairo2 libnspr4 libx11-xcb1 \
-    libdbus-1-3 libexpat1 libxfixes3 libxkbcommon0 libxkbfile1 \
-    libpcre2-8-0 libxcb1 libxcb-dri3-0 libxext6 libxrender1 \
-    xdg-utils procps && \
-    rm -rf /var/lib/apt/lists/*
+FROM mcr.microsoft.com/playwright/python:v1.49.1-noble
 
 WORKDIR /app
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt && \
-    playwright install chromium
+RUN pip install --no-cache-dir -r requirements.txt
 
 COPY anketa_bot.py .
 
